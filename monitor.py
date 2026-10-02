@@ -13,6 +13,10 @@ Konfiguration über Umgebungsvariablen (siehe README.md):
   OFFER_REGEX    optionale Regex für den Modus offers ohne Tabelle (Standard: €|EUR|kaufen)
   WATCH_IGNORE   optionale Regex, deren Treffer vor dem Vergleich entfernt werden
   NOTIFY_NOTE    optionaler Zusatzhinweis in der Nachricht (z. B. Ummeldegebühr)
+  ROW_INCLUDE    optionale Regex: nur Tabellenzeilen melden, die darauf passen (Zellen + Link)
+  ROW_EXCLUDE    optionale Regex: Tabellenzeilen, die darauf passen, ignorieren
+  WATCH_HOURS    optionales Zeitfenster in Ortszeit, z. B. 8-22 (= 08:00 bis 21:59). Leer = immer
+  WATCH_TZ       Zeitzone für WATCH_HOURS, Standard Europe/Berlin
   CLICK_URL      Link, der beim Tippen auf die Nachricht geöffnet wird (Standard: erste WATCH_URL)
   NTFY_TOPIC     Dein geheimes ntfy-Topic (Pflicht)
   NTFY_SERVER    Standard: https://ntfy.sh
@@ -28,8 +32,10 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -39,6 +45,10 @@ TEXT = os.environ.get("WATCH_TEXT", "").strip()
 OFFER_REGEX = os.environ.get("OFFER_REGEX", "").strip() or r"€|\beur\b|\bkaufen\b"
 IGNORE = os.environ.get("WATCH_IGNORE", "").strip()
 NOTE = os.environ.get("NOTIFY_NOTE", "").strip()
+ROW_INCLUDE = os.environ.get("ROW_INCLUDE", "").strip()
+ROW_EXCLUDE = os.environ.get("ROW_EXCLUDE", "").strip()
+WATCH_HOURS = os.environ.get("WATCH_HOURS", "").strip()
+WATCH_TZ = os.environ.get("WATCH_TZ", "").strip() or "Europe/Berlin"
 CLICK_URL = os.environ.get("CLICK_URL", "").strip()
 TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").strip().rstrip("/")
@@ -154,12 +164,22 @@ def describe_row(header: list, row: dict) -> str:
     return ", ".join(parts) if parts else " | ".join(c for c in cells if c)
 
 
+class NotifyError(RuntimeError):
+    """ntfy-Versand fehlgeschlagen. Die Meldung enthält bewusst weder URL noch Topic."""
+
+
 def notify(title: str, message: str, click: str = "") -> None:
     headers = {"Title": title, "Priority": "high", "Tags": "bell"}  # Title bewusst ASCII
     if click:
         headers["Click"] = click
-    response = requests.post(f"{SERVER}/{TOPIC}", data=message.encode("utf-8"), headers=headers, timeout=15)
-    response.raise_for_status()
+    try:
+        response = requests.post(f"{SERVER}/{TOPIC}", data=message.encode("utf-8"), headers=headers, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        reason = f"HTTP {status}" if status else type(exc).__name__
+        # "from None" unterdrückt den Traceback, der sonst die URL (mit Topic) ins öffentliche Log schreibt
+        raise NotifyError(f"ntfy-Versand fehlgeschlagen ({reason}). Topic prüfen: nur der Name, keine Leerzeichen.") from None
 
 
 def summarize_offer(text: str) -> str:
@@ -178,6 +198,38 @@ def summarize_offer(text: str) -> str:
     return (headline + "\n" if headline else "") + excerpt
 
 
+def in_window() -> bool:
+    """Prüft das Zeitfenster WATCH_HOURS (Ortszeit WATCH_TZ). Ende ist exklusiv: 8-22 = 08:00 bis 21:59."""
+    if not WATCH_HOURS:
+        return True
+    match = re.fullmatch(r"\s*(\d{1,2})\s*-\s*(\d{1,2})\s*", WATCH_HOURS)
+    if not match:
+        print(f"WATCH_HOURS '{WATCH_HOURS}' nicht lesbar (erwartet z. B. 8-22), Zeitfenster wird ignoriert.")
+        return True
+    start, end = int(match.group(1)), int(match.group(2))
+    try:
+        now = datetime.now(ZoneInfo(WATCH_TZ))
+    except Exception:  # noqa: BLE001 - unbekannte Zeitzone: auf Berlin zurückfallen
+        now = datetime.now(ZoneInfo("Europe/Berlin"))
+    active = (start <= now.hour < end) if start < end else (now.hour >= start or now.hour < end)
+    if not active:
+        print(f"Außerhalb des Zeitfensters {start}-{end} Uhr (jetzt {now:%H:%M} {WATCH_TZ}), keine Prüfung.")
+    return active
+
+
+def filter_rows(rows: list) -> list:
+    """Wendet ROW_INCLUDE/ROW_EXCLUDE auf Zellen und Links jeder Zeile an."""
+    kept = []
+    for row in rows:
+        haystack = " ".join(row["cells"] + row["links"])
+        if ROW_INCLUDE and not re.search(ROW_INCLUDE, haystack, re.I):
+            continue
+        if ROW_EXCLUDE and re.search(ROW_EXCLUDE, haystack, re.I):
+            continue
+        kept.append(row)
+    return kept
+
+
 def check_one(url: str, sub: dict) -> None:
     """Prüft eine URL und passt den Teilzustand `sub` an. Wirft RuntimeError bei Abruffehlern."""
     raw, text = fetch(url)
@@ -190,6 +242,10 @@ def check_one(url: str, sub: dict) -> None:
 
     if MODE == "offers":
         header, rows = table_rows(raw) if re.search(r"(?i)<table", raw) else ([], [])
+        total_rows = len(rows)
+        rows = filter_rows(rows)
+        if total_rows and not rows:
+            print(f"{total_rows} Angebot(e) vorhanden, aber durch ROW_INCLUDE/ROW_EXCLUDE ausgeschlossen.")
         if rows:  # Tabelle mit Datenzeilen = Angebote vorhanden
             digest = hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()
             has_offers = True
@@ -253,7 +309,11 @@ def main() -> int:
         print("NTFY_TOPIC fehlt.")
         return 2
     if "--test" in sys.argv:
-        notify("Startplatz-Monitor", "Testnachricht: Benachrichtigung funktioniert.", CLICK_URL or (URLS[0] if URLS else ""))
+        try:
+            notify("Startplatz-Monitor", "Testnachricht: Benachrichtigung funktioniert.", CLICK_URL or (URLS[0] if URLS else ""))
+        except NotifyError as exc:
+            print(exc)
+            return 1
         print("Testnachricht gesendet.")
         return 0
     if not URLS:
@@ -266,21 +326,34 @@ def main() -> int:
         print("Für appears/disappears wird WATCH_TEXT benötigt.")
         return 2
 
+    if not in_window():
+        return 0
+
     state = load_state()
+    notify_failed = False
     for url in URLS:
         sub = state.setdefault("u:" + url, {})
         try:
             check_one(url, sub)
             sub["errors"] = 0
+        except NotifyError as exc:
+            notify_failed = True
+            print(f"{exc} (Seite: {url})")
         except RuntimeError as exc:
             errors = int(sub.get("errors", 0)) + 1
             sub["errors"] = errors
             print(f"Abruf fehlgeschlagen ({errors}x in Folge): {url}: {exc}")
             if errors == ERR_ALERT_AFTER:
-                notify("Startplatz-Monitor Fehler",
-                       f"{url} seit {errors} Prüfungen nicht abrufbar: {exc}", CLICK_URL or url)
+                try:
+                    notify("Startplatz-Monitor Fehler",
+                           f"{url} seit {errors} Prüfungen nicht abrufbar: {exc}", CLICK_URL or url)
+                except NotifyError as notify_exc:
+                    notify_failed = True
+                    print(notify_exc)
     save_state(state)
-    return 0  # kein Workflow-Fehler, damit GitHub keine Mail-Flut schickt
+    # Seitenfehler sollen keine Mail-Flut auslösen, ein kaputter Benachrichtigungsweg schon:
+    # sonst würdest du Angebote verpassen, ohne es zu merken.
+    return 1 if notify_failed else 0
 
 
 if __name__ == "__main__":
