@@ -2,8 +2,10 @@ name: startplatz-monitor
 
 on:
   schedule:
-    # alle 5 Minuten, versetzt zum vollen 5er-Takt (GitHub ist dort oft überlastet)
-    - cron: "3-58/5 * * * *"
+    # alle 5 Minuten, versetzt zum vollen 5er-Takt (GitHub ist dort oft überlastet).
+    # Cron läuft in UTC: 6-21 Uhr UTC deckt 8-22 Uhr Ortszeit in Sommer- und Winterzeit ab,
+    # die genaue Grenze prüft monitor.py über WATCH_HOURS.
+    - cron: "3-58/5 6-21 * * *"
   workflow_dispatch:
     inputs:
       test:
@@ -46,6 +48,10 @@ jobs:
           WATCH_IGNORE: ${{ vars.WATCH_IGNORE }}
           OFFER_REGEX: ${{ vars.OFFER_REGEX }}
           NOTIFY_NOTE: ${{ vars.NOTIFY_NOTE }}
+          WATCH_HOURS: ${{ vars.WATCH_HOURS }}
+          WATCH_TZ: ${{ vars.WATCH_TZ }}
+          ROW_INCLUDE: ${{ vars.ROW_INCLUDE }}
+          ROW_EXCLUDE: ${{ vars.ROW_EXCLUDE }}
           CLICK_URL: ${{ vars.CLICK_URL }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
