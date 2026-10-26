@@ -1,0 +1,58 @@
+name: startplatz-monitor-bonn
+
+on:
+  schedule:
+    # alle 5 Minuten, versetzt zu monitor.yml; Cron läuft in UTC (6-21 deckt 8-22 Uhr Ortszeit ab),
+    # die genaue Grenze prüft monitor.py über WATCH_HOURS.
+    - cron: "1-56/5 6-21 * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Nur Testnachricht senden"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: startplatz-monitor-bonn
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Zustand wiederherstellen
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-bonn-${{ github.run_id }}
+          restore-keys: state-bonn-
+
+      - name: Prüfen
+        env:
+          WATCH_URL: https://www.datasport.de/anmeldeservice/492/3316/12154
+          WATCH_MODE: disappears
+          WATCH_TEXT: "aktuell kein Platz verfügbar||keine Startplätze mehr verfügbar"
+          REQUIRE_TEXT: Bonn Triathlon
+          WATCH_HOURS: "8-22"
+          WATCH_TZ: Europe/Berlin
+          NOTIFY_NOTE: "Bonn Triathlon Mitteldistanz: Platz ist nur ca. 10 Min reserviert, sofort öffnen. Regulaere Anmeldung: https://www.datasport.de/anmeldeservice/492/3316/12154 | Boerse: https://www.datasport.de/anmeldeservice/492/3316/boerse/12154/"
+          CLICK_URL: https://www.datasport.de/anmeldeservice/492/3316/boerse/12154/
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ "${{ github.event.inputs.test }}" = "true" ]; then
+            python monitor.py --test
+          else
+            python monitor.py
+          fi
