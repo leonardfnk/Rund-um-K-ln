@@ -9,7 +9,9 @@ Konfiguration über Umgebungsvariablen (siehe README.md):
                    change      meldet jede Änderung des sichtbaren Seitentexts
                    appears     meldet, wenn WATCH_TEXT auftaucht
                    disappears  meldet, wenn WATCH_TEXT verschwindet
-  WATCH_TEXT     Suchtext für appears/disappears
+  WATCH_TEXT     Suchtext für appears/disappears; mehrere Texte mit || trennen (jeder wird einzeln überwacht)
+  REQUIRE_TEXT   optional: Text, der auf der Seite stehen muss, sonst gilt der Abruf als Fehler
+                 (schützt vor Fehlalarm bei Wartungs-/Fehlerseiten)
   OFFER_REGEX    optionale Regex für den Modus offers ohne Tabelle (Standard: €|EUR|kaufen)
   WATCH_IGNORE   optionale Regex, deren Treffer vor dem Vergleich entfernt werden
   NOTIFY_NOTE    optionaler Zusatzhinweis in der Nachricht (z. B. Ummeldegebühr)
@@ -42,6 +44,7 @@ import requests
 URLS = [u for u in re.split(r"[\s,]+", os.environ.get("WATCH_URL", "").strip()) if u]
 MODE = os.environ.get("WATCH_MODE", "offers").strip().lower() or "offers"
 TEXT = os.environ.get("WATCH_TEXT", "").strip()
+REQUIRE_TEXT = os.environ.get("REQUIRE_TEXT", "").strip()
 OFFER_REGEX = os.environ.get("OFFER_REGEX", "").strip() or r"€|\beur\b|\bkaufen\b"
 IGNORE = os.environ.get("WATCH_IGNORE", "").strip()
 NOTE = os.environ.get("NOTIFY_NOTE", "").strip()
@@ -230,11 +233,18 @@ def filter_rows(rows: list) -> list:
     return kept
 
 
+def texts() -> list:
+    return [t.strip() for t in TEXT.split("||") if t.strip()]
+
+
 def check_one(url: str, sub: dict) -> None:
     """Prüft eine URL und passt den Teilzustand `sub` an. Wirft RuntimeError bei Abruffehlern."""
     raw, text = fetch(url)
     lowered = text.lower()
     click = CLICK_URL or url
+
+    if REQUIRE_TEXT and REQUIRE_TEXT.lower() not in lowered:
+        raise RuntimeError(f"Erwarteter Text '{REQUIRE_TEXT}' fehlt (Fehler-/Wartungsseite oder Bot-Sperre?)")
 
     if "lade …" in lowered or "lade ..." in lowered:
         print(f"Hinweis: {url} enthält nur den Platzhalter 'Lade …'. Die Angebote kommen vermutlich "
@@ -287,21 +297,37 @@ def check_one(url: str, sub: dict) -> None:
             print("Keine Änderung." if previous else "Erster Lauf, Zustand gespeichert.")
         sub["hash"] = digest
     elif MODE == "appears":
-        present = TEXT.lower() in lowered
-        if present and not sub.get("present"):
-            notify("Startplatz-Alarm", f"Text gefunden: {TEXT}", click)
+        old = sub.get("present_map") or {}
+        if not isinstance(old, dict):
+            old = {}
+        current = {t: (t.lower() in lowered) for t in texts()}
+        newly = [t for t, here in current.items() if here and not old.get(t, sub.get("present") if len(current) == 1 else False)]
+        if newly:
+            message = "Text gefunden: " + "; ".join(newly)
+            if NOTE:
+                message += "\n" + NOTE
+            notify("Startplatz-Alarm", message, click)
             print("Text aufgetaucht, Benachrichtigung gesendet.")
         else:
-            print("Text vorhanden (bereits gemeldet)." if present else "Text nicht vorhanden.")
-        sub["present"] = present
+            print("Text vorhanden (bereits gemeldet)." if any(current.values()) else "Text nicht vorhanden.")
+        sub["present_map"] = current
+        sub["present"] = any(current.values())
     else:  # disappears
-        gone = TEXT.lower() not in lowered
-        if gone and not sub.get("gone"):
-            notify("Startplatz-Alarm", f"Der Text ist verschwunden: {TEXT}. Vermutlich sind Plätze da.", click)
+        old = sub.get("gone_map") or {}
+        if not isinstance(old, dict):
+            old = {}
+        current = {t: (t.lower() not in lowered) for t in texts()}
+        newly = [t for t, gone in current.items() if gone and not old.get(t, sub.get("gone") if len(current) == 1 else False)]
+        if newly:
+            message = "Auf der Seite fehlt jetzt: " + "; ".join(f"\"{t}\"" for t in newly) + ". Vermutlich ist ein Platz frei."
+            if NOTE:
+                message += "\n" + NOTE
+            notify("Startplatz-Alarm", message, click)
             print("Text verschwunden, Benachrichtigung gesendet.")
         else:
-            print("Text weiterhin weg (bereits gemeldet)." if gone else "Text weiterhin vorhanden.")
-        sub["gone"] = gone
+            print("Text weiterhin weg (bereits gemeldet)." if any(current.values()) else "Text weiterhin vorhanden.")
+        sub["gone_map"] = current
+        sub["gone"] = any(current.values())
 
 
 def main() -> int:
